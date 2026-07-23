@@ -382,7 +382,7 @@ async function ensureModel(){
 
 /* ---------------- Pipeline ---------------- */
 async function processFiles(fileList){
-  const files = [...fileList].filter(f=>f.type.startsWith('image/')).slice(0,16);
+  const files = [...fileList].filter(f=>f.type.startsWith('image/')).slice(0,12);
   if(!files.length){ return; }
   show('proc');
   $('procGrid').innerHTML=''; $('procErr').innerHTML=''; $('procSpin').style.display='block';
@@ -428,13 +428,34 @@ async function processOne(file, idx){
   const tags = mapLabelsToTags(preds);
   const quality = qualityFrom(sq, preds[0] ? preds[0].probability : 0.3);
   const exif = await readExif(file);
-  const reel = cover(img, 600, 1067);      // 9:16 frame kept for the reel
+  const reel = null;      // frames are drawn from `src` at render time
   const thumb = toThumb(cover(img,220,220), 120);
+  const src = await toSourceImage(img);
   URL.revokeObjectURL(url);
   return { id:'p'+idx, type:'photo', capturedAt:exif.capturedAt, lat:exif.lat, lng:exif.lng,
-           tags, quality, reel, thumb,
+           tags, quality, src, thumb,
            topLabel: preds[0] ? preds[0].className.split(',')[0] : '—',
            topProb: preds[0] ? preds[0].probability : 0 };
+}
+
+/* Downscale to a compact JPEG and hand back a decoded <img>.
+   Critical on mobile: a retained canvas keeps a large backing store that the
+   browser silently discards under memory pressure (→ black frames). An <img>
+   backed by a small blob is re-decodable and survives. Original aspect is kept
+   so each output format can crop from the full frame. */
+async function toSourceImage(img){
+  const MAX = 900;
+  const iw = img.naturalWidth||img.width, ih = img.naturalHeight||img.height;
+  const scale = Math.min(1, MAX/Math.max(iw,ih));
+  const w = Math.max(1,Math.round(iw*scale)), h = Math.max(1,Math.round(ih*scale));
+  const c = document.createElement('canvas'); c.width=w; c.height=h;
+  c.getContext('2d').drawImage(img,0,0,w,h);
+  const url = await new Promise(res=>{
+    if(c.toBlob) c.toBlob(b=> res(b?URL.createObjectURL(b):c.toDataURL('image/jpeg',0.82)), 'image/jpeg', 0.82);
+    else res(c.toDataURL('image/jpeg',0.82));
+  });
+  c.width=c.height=1;              // release the backing store immediately
+  return loadImage(url);
 }
 
 function addCell(rec){
@@ -460,14 +481,16 @@ function runDemo(){
     {tags:['pet','animal','dog'],q:.88,c:['#9A6BD0','#E3C7F0'],l:'Good boy'},
     {tags:['mountain','nature','snow'],q:.80,c:['#6FA8DC','#E8F2FB'],l:'Manali'},
   ];
-  records = demo.map((d,i)=>({
-    id:'d'+i, type:'photo', capturedAt:Date.now()-(i+1)*2*86400000,
-    tags:d.tags.map(label=>({label,confidence:0.85})), quality:d.q,
-    reel:gradientReel(d.c[0],d.c[1],d.l), thumb:gradientReel(d.c[0],d.c[1],d.l).toDataURL('image/jpeg',0.6),
-    topLabel:d.l, topProb:0.85
-  }));
-  threshold=0.45; $('thresh').value='0.45'; $('tval').textContent='0.45';
-  buildFeed(); show('feed');
+  Promise.all(demo.map(async (d,i)=>{
+    const dataUrl = gradientReel(d.c[0],d.c[1],d.l).toDataURL('image/jpeg',0.8);
+    return { id:'d'+i, type:'photo', capturedAt:Date.now()-(i+1)*2*86400000,
+             tags:d.tags.map(label=>({label,confidence:0.85})), quality:d.q,
+             src: await loadImage(dataUrl), thumb:dataUrl, topLabel:d.l, topProb:0.85 };
+  })).then(recs=>{
+    records = recs;
+    threshold=0.45; $('thresh').value='0.45'; $('tval').textContent='0.45';
+    buildFeed(); show('feed');
+  });
 }
 
 /* ---------------- Feed ---------------- */
@@ -500,31 +523,38 @@ function buildFeed(){
 }
 
 /* ---------------- Reel ---------------- */
-let reelRAF=null;
+let reelRAF=null, currentFmt='reel', currentRecs=[];
+const FORMATS = {
+  reel:  {label:'Reel',  ratio:'9:16', w:540, h:960, css:'9/16'},
+  story: {label:'Story', ratio:'9:16', w:540, h:960, css:'9/16'},
+  post:  {label:'Post',  ratio:'4:5',  w:540, h:675, css:'4/5'}
+};
+
 function openReel(r){
   cancelAnimationFrame(reelRAF);
   show('reel');
   if(r.mode==='advisor'){ renderAdvisor(r); return; }
+  currentFmt='reel'; currentRecs=r.selected;
   renderBuild(r);
-  requestAnimationFrame(()=>playReel(r.selected));
+  playReel(currentRecs);
 }
 
 function renderBuild(r){
-  const t=r.trend, canSave = canRecord();
+  const t=r.trend, f=FORMATS[currentFmt], canSave=canRecord();
+  const fmtHtml = Object.keys(FORMATS).map(k=>{
+    const ff=FORMATS[k];
+    return `<div class="fmt${k===currentFmt?' on':''}" data-fmt="${k}">${ff.label}<span>${ff.ratio}</span></div>`;
+  }).join('');
   $('reelBody').innerHTML = `
     <div class="reel-h">${t.title}</div>
-    <div class="stage">
-      <canvas id="reelCanvas" width="540" height="960"></canvas>
+    <div class="stage" id="stage" style="aspect-ratio:${f.css}">
+      <canvas id="reelCanvas" width="${f.w}" height="${f.h}"></canvas>
       <div class="replay" id="replay"><button id="replayBtn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.3 2.6L3 8"/><path d="M3 3v5h5"/></svg> Play again</button></div>
     </div>
     <div class="rmeta">
       <div class="seclbl">Built from ${r.selected.length} of your photos</div>
-      <div class="fmts">
-        <div class="fmt on">Reel<span>9:16</span></div>
-        <div class="fmt">Story<span>9:16</span></div>
-        <div class="fmt">Post<span>4:5</span></div>
-      </div>
+      <div class="fmts" id="fmts">${fmtHtml}</div>
       <div class="seclbl">Add this sound in Instagram</div>
       <div class="sound"><div class="i">♪</div><div><b>${t.sound.name}</b><small>${t.sound.uses} · add it natively after export — keeps the audio licensed</small></div></div>
       <button class="save" id="saveBtn">
@@ -532,8 +562,26 @@ function renderBuild(r){
         ${canSave ? 'Save reel (beta)' : 'To save: screen-record the playback'}
       </button>
     </div>`;
-  $('replayBtn').onclick = ()=>{ $('replay').classList.remove('on'); playReel(r.selected); };
-  $('saveBtn').onclick = ()=> canSave ? recordReel(r.selected) : toast('Real MP4 export is the native app’s job — screen-record for now');
+
+  $('replayBtn').onclick = ()=>{ $('replay').classList.remove('on'); playReel(currentRecs); };
+  $('saveBtn').onclick = ()=> canSave
+    ? recordReel(currentRecs)
+    : toast('This browser can’t export video — screen-record the playback');
+
+  // Format switching: resize the canvas + stage, then replay at the new crop.
+  $('fmts').querySelectorAll('.fmt').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const k = el.getAttribute('data-fmt');
+      if(k===currentFmt) return;
+      currentFmt = k;
+      const nf = FORMATS[k], cv = $('reelCanvas');
+      cv.width = nf.w; cv.height = nf.h;
+      $('stage').style.aspectRatio = nf.css;
+      $('fmts').querySelectorAll('.fmt').forEach(x=>x.classList.toggle('on', x===el));
+      $('replay').classList.remove('on');
+      playReel(currentRecs);
+    });
+  });
 }
 
 function renderAdvisor(r){
@@ -552,27 +600,44 @@ function renderAdvisor(r){
     <div class="sound"><div class="i">♪</div><div><b>${t.sound.name}</b><small>${t.sound.uses} · save it now, build once you’ve filmed</small></div></div>`;
 }
 
-function drawKB(ctx, src, t, W, H, alpha){
-  const zoom = 1.0 + 0.06*t;
-  const sw = src.width/zoom, sh = src.height/zoom;
-  const sx = (src.width-sw)*(0.5 + 0.05*Math.sin(t*Math.PI));
-  const sy = (src.height-sh)*0.5;
+/* Cover-crop + Ken Burns, drawn from an <img> at the canvas's current aspect. */
+function drawFrame(ctx, rec, t, W, H, alpha){
+  const img = rec && rec.src;
+  if(!img || !img.complete || !img.naturalWidth){
+    ctx.globalAlpha = alpha; ctx.fillStyle = '#2A2637'; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1;
+    return;
+  }
+  const iw=img.naturalWidth, ih=img.naturalHeight;
+  const zoom = 1.0 + 0.06*t, targetR = W/H;
+  // cover-crop the source to the target aspect, then zoom in for the Ken Burns move
+  let cw, ch;
+  if(iw/ih > targetR){ ch = ih; cw = ch*targetR; } else { cw = iw; ch = cw/targetR; }
+  const sw = cw/zoom, sh = ch/zoom;
+  const sx = (iw-sw)*(0.5 + 0.05*Math.sin(t*Math.PI));
+  const sy = (ih-sh)*0.5;
   ctx.globalAlpha = alpha;
-  ctx.drawImage(src, sx,sy,sw,sh, 0,0,W,H);
+  ctx.drawImage(img, sx,sy,sw,sh, 0,0,W,H);
   ctx.globalAlpha = 1;
 }
+
 function playReel(recs){
-  const canvas=$('reelCanvas'); if(!canvas) return;
+  const canvas=$('reelCanvas'); if(!canvas || !recs || !recs.length) return;
   const ctx=canvas.getContext('2d'), W=canvas.width, H=canvas.height;
-  const per=2500, fade=450, total=recs.length*per, start=performance.now();
+  const per=2500, fade=450, total=recs.length*per;
   cancelAnimationFrame(reelRAF);
+
+  // Paint frame zero synchronously so the stage is never blank, even if rAF is throttled.
+  ctx.clearRect(0,0,W,H);
+  drawFrame(ctx, recs[0], 0, W, H, 1);
+
+  const start=performance.now();
   function frame(now){
     let el=now-start; if(el>total) el=total;
     const idx=Math.min(Math.floor(el/per), recs.length-1);
     const into=el-idx*per, lt=Math.min(into/per,1);
     ctx.clearRect(0,0,W,H);
-    drawKB(ctx, recs[idx].reel, lt, W, H, 1);
-    if(into>per-fade && idx<recs.length-1) drawKB(ctx, recs[idx+1].reel, 0, W, H, (into-(per-fade))/fade);
+    drawFrame(ctx, recs[idx], lt, W, H, 1);
+    if(into>per-fade && idx<recs.length-1) drawFrame(ctx, recs[idx+1], 0, W, H, (into-(per-fade))/fade);
     if(el<total) reelRAF=requestAnimationFrame(frame);
     else { const rp=$('replay'); if(rp) rp.classList.add('on'); }
   }
@@ -580,29 +645,37 @@ function playReel(recs){
 }
 
 /* ---------------- Best-effort save ---------------- */
+const REC_MIMES = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+function pickMime(){
+  if(!window.MediaRecorder || !MediaRecorder.isTypeSupported) return null;
+  return REC_MIMES.find(m=>MediaRecorder.isTypeSupported(m)) || null;
+}
 function canRecord(){
   try{
     const c=document.createElement('canvas');
-    return !!(c.captureStream && window.MediaRecorder && MediaRecorder.isTypeSupported &&
-      (MediaRecorder.isTypeSupported('video/webm;codecs=vp9') || MediaRecorder.isTypeSupported('video/webm;codecs=vp8') || MediaRecorder.isTypeSupported('video/webm')));
+    return !!(c.captureStream && pickMime());
   }catch(e){ return false; }
 }
 function recordReel(recs){
   try{
     const canvas=$('reelCanvas'); if(!canvas) return;
+    const mime=pickMime(); if(!mime) return toast('This browser can’t export video — screen-record instead');
+    const ext = mime.indexOf('mp4')>-1 ? 'mp4' : 'webm';
     const stream=canvas.captureStream(30);
-    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
-               : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm';
     const rec=new MediaRecorder(stream,{mimeType:mime}); const chunks=[];
-    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+    rec.ondataavailable=e=>{ if(e.data && e.data.size) chunks.push(e.data); };
     rec.onstop=()=>{
-      const blob=new Blob(chunks,{type:'video/webm'}); const url=URL.createObjectURL(blob);
-      const a=document.createElement('a'); a.href=url; a.download='camena-reel.webm'; a.click();
-      setTimeout(()=>URL.revokeObjectURL(url),3000); toast('Saved camena-reel.webm');
+      if(!chunks.length) return toast('Export came out empty — screen-record instead');
+      const blob=new Blob(chunks,{type:mime.split(';')[0]});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download='camena-reel.'+ext;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),4000);
+      toast('Saved camena-reel.'+ext);
     };
     $('replay') && $('replay').classList.remove('on');
-    rec.start(); playReel(recs);
-    setTimeout(()=>{ try{ rec.stop(); }catch(e){} }, recs.length*2500 + 250);
+    rec.start(100); playReel(recs);
+    setTimeout(()=>{ try{ if(rec.state!=='inactive') rec.stop(); }catch(e){} }, recs.length*2500 + 400);
     toast('Recording the reel…');
   }catch(e){ toast('Couldn’t record here — screen-record instead'); }
 }
